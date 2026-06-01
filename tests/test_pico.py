@@ -2,6 +2,7 @@ import os
 import json
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -394,6 +395,80 @@ def test_openai_compatible_client_posts_expected_responses_payload():
         "stream": False,
         "temperature": 0.2,
     }
+
+
+def test_openai_compatible_client_falls_back_to_chat_completions_on_responses_404():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "<final>chat ok</final>",
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 4,
+                        "total_tokens": 16,
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured.setdefault("urls", []).append(request.full_url)
+        if request.full_url.endswith("/responses"):
+            raise urllib.error.HTTPError(request.full_url, 404, "", {}, None)
+        captured["timeout"] = timeout
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="qwen3.6-plus",
+        base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>chat ok</final>"
+    assert captured["urls"] == [
+        "https://coding-intl.dashscope.aliyuncs.com/v1/responses",
+        "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions",
+    ]
+    assert captured["timeout"] == 30
+    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["body"] == {
+        "model": "qwen3.6-plus",
+        "messages": [
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        "max_tokens": 42,
+        "stream": False,
+        "temperature": 0.2,
+    }
+    assert client.last_completion_metadata["prompt_cache_supported"] is False
+    assert client.last_completion_metadata["input_tokens"] == 12
+    assert client.last_completion_metadata["output_tokens"] == 4
 
 
 def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
